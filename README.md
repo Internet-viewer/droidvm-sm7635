@@ -341,6 +341,143 @@ int main(void){
 | 引导 | UEFI（DroidVM 内置 EDK2） |
 | 登录 | 串口 `ttyS0`；cloud 镜像 root 默认无密码 |
 
+## 7. 拿到「能登录」的镜像（Alpine cloud 的 root 是锁定的）
+
+`alpine-*-uefi-cloudinit-r0.qcow2` 靠 cloud-init 注入用户；DroidVM 不提供 seed，所以镜像里就是：
+
+```
+/etc/shadow: root:!*:...      ← 账户锁定，串口既不能空密码也没有可猜的默认密码
+```
+
+**离线注入密码 + 公钥**（镜像必须先停 VM）：
+
+```bash
+sudo ./scripts/inject-alpine-password.sh alpine.qcow2 alpine ~/.ssh/id_ed25519.pub
+# -> alpine.injected.qcow2 （root/alpine，已注入公钥、PermitRootLogin yes）
+```
+
+> ⚠️ **必须在 Linux 主机上做，不要在手机上做**：DroidVM 自带的 `qemu-img` 解不开该镜像的**压缩簇**，
+> `qemu-img convert` 出来的 raw **全是 0**（实测前 41 MB 非零字节数 = 0），改出来的镜像不可引导。
+> 主机上正常 qemu-img（10.x）转换后 GPT/ESP 都完整。
+
+## 8. 磁盘镜像完整性自检（换盘后必查）
+
+| 检查 | 命令 | 正常值 |
+|---|---|---|
+| MAGIC | `od -A d -t x1 -N 8 disk.qcow2` | `51 46 49 fb`（`QFI\xfb`） |
+| 格式/容量 | `qemu-img info disk.qcow2` | `file format: qcow2` + `virtual size: 330 MiB` |
+| crosvm 识别 | `droidvm logs <id> stdio \| grep 'disk size'` | 应为 **346030080**（虚拟容量） |
+
+若 `disk size` 等于**文件大小**（例如 139001856），说明 crosvm 把 qcow2 容器当**裸盘**处理了，
+里面自然没有分区 → UEFI 找不到启动项 → 掉 PXE。
+
+## 9. UEFI 变量存储（pflash）导致的 PXE 回退
+
+症状：
+
+```
+BdsDxe: failed to load Boot0002 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x1,0x0): Not Found
+>>Start PXE over IPv4.
+```
+
+原因：pflash 里保存的启动项指向已不存在的设备（换过盘/换过镜像后常见）。修法（VM 停止时）：
+
+```json
+"boot": { "protocol": "uefi", "uefi": { "vars_enabled": false, "vars": "", "firmware": "" } }
+```
+
+关掉 vars 后固件会走默认启动顺序，命中 ESP 里的 `EFI/BOOT/BOOTAA64.EFI`。
+
+## 10. `GUNYAH-SHARE-BLOB ... Out of memory (os error 12)`
+
+另一类启动失败（与 boot context 无关）：
+
+```
+GUNYAH-SHARE-BLOB: gpa=0x80600000 size=0x1f600000 flags=0x7 FAILED after 17ms: Out of memory (os error 12)
+[730.854] gunyah_share: crosvm is gone but the RM still refuses label=525824 (-22)
+[734.852] gunyah_share: mem_alloc FAILED ret=-12 gpa=0x80600000 size=0x1f600000 label=525824
+```
+
+两件事叠加：① 上次异常退出在 Gunyah RM 里留下的 memparcel（label = `gpa>>12`）还没释放；② 502 MB 的连续内存吃紧。
+
+处置顺序（都不需要重启手机）：
+
+```bash
+su -c 'rmmod gunyah_host_share_gki_6.1; sleep 1; /data/adb/ksud insmod /data/data/cn.classfun.droidvm/usr/lib/modules/android14-6.1/gunyah-host-share-gki-6.1.ko'
+su -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+# 然后从 App 重新 Start（512 MB 配置即可成功，实测 SHARE-BLOB 453ms）
+```
+
+> ⚠️ **`Huge-page reserve is short` 弹窗不要点 Start anyway**：实测会导致整机崩溃（需硬重启 + 重跑 GhostLock）。
+> 另外 App 只接受「它自己安装的」大页模块池：手动 `insmod` 的模块虽然出现 `/dev/gh_pinprobe`，
+> 但 Pool Size 一直是 0、Save 灰掉、Acquire 无效 —— 正确做法是在 App 的 HugePage 页面里 `Install` 再设池子。
+
+## 11. Guest 网络：为什么 `apk update` 不通 + 正确配法
+
+**症状**：guest 里 `apk update` 全是 `temporary error (try again later)`。
+
+**根因**：VM 挂在 `Wi-Fi pseudo-bridge`（L2 伪桥）上，guest 的地址要靠**路由器** DHCP 下发；
+本机实测 guest 只拿到 IPv6 链路本地地址（`ip neigh show dev br-wifi` 只有 `fe80::…`），**没有 IPv4** ⇒ 无默认路由。
+
+**修法**：换成 **Linux bridge + L3 routing（DroidVM 自带 DHCP + SNAT）**，并补 DNS（默认 `dns_servers` 是空数组）：
+
+```bash
+su -c 'sh scripts/switch-vm-to-nat.sh <network_id> <vm_id>'
+```
+
+等价配置（`files/networks.json`）：
+
+```json
+"l3": { "dns_servers": ["1.1.1.1", "8.8.8.8"],
+  "vlans": [ { "vlan_id": 0, "ipv4": { "cidr": "192.168.207.1/24", "snat": true,
+      "dhcp": { "enabled": true, "offset_start": 128, "offset_end": 192 },
+      "dns_servers": ["1.1.1.1", "8.8.8.8"] } } ] }
+```
+
+实测结果：guest 拿到 `192.168.207.128`（宿主 ↔ guest ping 1.5 ms），`apk update` 正常。
+
+**路由实际怎么走**（手机上的真实规则）：
+
+```
+ip rule 9000: from all iif brded40231 lookup tun1      ← guest 流量先查 VPN 表
+ip rule 9001: from all iif brded40231 lookup wlan0_local
+ip rule 9002: from all iif brded40231 lookup wlan0
+
+iptables -t nat: -A droidvm_pst_brded40231 -s 192.168.207.0/24 ! -o brded40231+ -j MASQUERADE
+```
+
+⇒ guest → 桥（192.168.207.1，DroidVM DHCP）→ SNAT → 手机当前上行（**优先 tun1 = miphone VPN**）。
+conntrack 里能看到回包目的地址是 `10.231.87.3`（tun1），即 **guest 共享手机 VPN 出口**。
+
+| 场景 | guest 能否上网 |
+|---|---|
+| 换 Wi-Fi | ✅（规则回落到 wlan0 表） |
+| Wi-Fi + VPN | ✅（走 tun1，公网 IP = VPN 出口） |
+| 只蜂窝 + VPN | ✅ |
+| **只蜂窝、无 VPN** | ⚠️ 默认规则里没有 rmnet 表，`main` 表也无默认路由 → 会断；需额外加 `ip rule … lookup rmnet_dataN` |
+
+**Alpine 侧不用改任何 IP**：`192.168.207.128/24` + 网关 `.1` 是手机内部网段，换上行不影响；
+只有已建立的 TCP 连接在切换瞬间会断一下（NAT 重绑），重连即可。DNS 由 DHCP 下发，也不用改 `resolv.conf`。
+
+## 12. 硬重启 + 重跑 GhostLock 之后的一键复原
+
+GhostLock 是 **late-load**：KernelSU 在开机后才载入，模块的 `post-fs-data.sh` / `service.sh` **不会执行**。
+所以每次重新拿到 root 后跑一次：
+
+```bash
+su -c 'sh /data/local/tmp/droidvm-bootstrap.sh'
+```
+
+它做 8 件事（幂等）：补 `/dev/gunyah_share` → 可选大页模块 → 关幻影进程监控 → 起 **root 常驻 sshd**（`su` 会重置 `HOME`，脚本显式指回 Termux 家目录）→ 校验 `vmshim.so` + crosvm 包装（App 升级覆盖后自动重建）→ 校验 VM 配置（512MB / mTHP single / hugepages true / pseudo_unprotected / uefi）→ 给关键进程打 `oom_score_adj=-1000` → 打印汇总。
+
+## 12.1 脚本清单
+
+| 脚本 | 用途 | 在哪跑 |
+|---|---|---|
+| `scripts/droidvm-bootstrap.sh` | 重启后一键复原（模块 + sshd + 包装 + 配置） | 手机 root |
+| `scripts/inject-alpine-password.sh` | 给 Alpine cloud 镜像注入 root 密码/公钥 | Linux 主机 |
+| `scripts/switch-vm-to-nat.sh` | 把 VM 切到 L3(NAT+DHCP) 网络并补 DNS | 手机 root |
+
 ## 参考
 
 - DroidVM：<https://github.com/Droid-VM/DroidVM> ｜ 文档 <https://droid-vm.github.io/>
