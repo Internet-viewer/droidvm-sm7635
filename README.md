@@ -602,3 +602,26 @@ VM 设置：`memory_mb=<上面算的值>`、`prepare_lend_mthp=single`、`hugepa
 
 `gh-hugepage-reserve` 的中文 README 已快照到本仓库：[docs/gh-hugepage-reserve-README_cn.md](docs/gh-hugepage-reserve-README_cn.md)
 （含 sysfs 参数契约、`settings.prop` 键、`load.sh` 阶梯、`acquire` 三模式、CMA 两个 lever 等细节）。
+
+## 14. 手机端脚本集（`~/droidvm`）
+
+`phone/` 目录是手机上 `~/droidvm/` 的镜像，四个东西：
+
+| 文件 | 作用 |
+|---|---|
+| `phone/setup.sh` | 一键环境（`/dev/gunyah_share`、kvcalloc、大页模块、root sshd、crosvm 包装、VM 配置）幂等 |
+| `phone/pool.sh` | 大页池扩容：`status` / `cancel` / `<目标页数> <轮数>` |
+| `phone/vm.sh` | VM 管理：`status` / `max` / `set <MB>` / `start` / `stop` / `logs` |
+| `phone/README.md` | 这套脚本自己的说明（坑表、容量公式、常用查询） |
+
+部署到手机：
+
+```bash
+# 在手机 Termux 里
+mkdir -p ~/droidvm && cd ~/droidvm
+curl -sL -o setup.sh  https://raw.githubusercontent.com/Internet-viewer/droidvm-sm7635/master/phone/setup.sh
+curl -sL -o pool.sh   https://raw.githubusercontent.com/Internet-viewer/droidvm-sm7635/master/phone/pool.sh
+curl -sL -o vm.sh     https://raw.githubusercontent.com/Internet-viewer/droidvm-sm7635/master/phone/vm.sh
+curl -sL -o README.md https://raw.githubusercontent.com/Internet-viewer/droidvm-sm7635/master/phone/README.md
+chmod 755 *.sh
+```
