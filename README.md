@@ -625,3 +625,138 @@ curl -sL -o vm.sh     https://raw.githubusercontent.com/Internet-viewer/droidvm-
 curl -sL -o README.md https://raw.githubusercontent.com/Internet-viewer/droidvm-sm7635/master/phone/README.md
 chmod 755 *.sh
 ```
+
+## 15. Debian 13 (trixie) 实例：16 GB 盘 / 1 GB RAM / 1 GB swap
+
+跑在 600 页池子（1200 MB）上的 Debian 13 arm64 cloud 镜像，`memory_mb=1024`。
+
+### 15.1 镜像做法（在 x86_64 构建机上）
+
+```bash
+# 1) 取 cloud 镜像并扩到 16 GB
+curl -sSL -o debian13.qcow2 https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+qemu-img resize debian13.qcow2 16G
+
+# 2) qcow2 -> raw，扩分区 + 扩文件系统（**PARTUUID 坑见 15.2**）
+qemu-img convert -f qcow2 -O raw debian13.qcow2 debian.raw
+LOOP=$(losetup -f --show -P debian.raw)
+sgdisk -e $LOOP                       # 先把备份 GPT 挪到盘尾
+sgdisk -d 1 $LOOP                     # 删掉 root 分区
+sgdisk -n 1:262144:0 -t 1:8300 -c 1:root $LOOP
+partprobe $LOOP
+e2fsck -f -y ${LOOP}p1; resize2fs ${LOOP}p1
+
+# 3) 注入 root 密码 / 公钥 / swap / 串口
+mount ${LOOP}p1 /mnt/dv
+HASH=$(openssl passwd -6 debian)
+sed -i "s|^root:[^:]*:|root:${HASH}:|" /mnt/dv/etc/shadow
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /mnt/dv/etc/ssh/sshd_config
+fallocate -l 1G /mnt/dv/swapfile && chmod 600 /mnt/dv/swapfile && mkswap /mnt/dv/swapfile
+echo '/swapfile none swap sw 0 0' >> /mnt/dv/etc/fstab
+systemctl --root=/mnt/dv enable serial-getty@ttyS0.service
+umount /mnt/dv; losetup -d $LOOP
+
+# 4) 回 qcow2
+qemu-img convert -f raw -O qcow2 debian.raw debian13-droidvm.qcow2
+```
+
+### 15.2 坑一：`sgdisk -d/-n` 会换掉 PARTUUID，grub 直接找不到 root
+
+删掉再新建分区后，**分区的 unique GUID 是新生成的**，而 `/boot/grub/grub.cfg` 里写的还是
+旧值 —— initramfs 会报：
+
+```
+ALERT! PARTUUID=4cba83b2-... does not exist. Dropping to a shell!
+```
+
+修法（保留 grub 里的旧值，把分区改回去）：
+
+```bash
+qemu-nbd -c /dev/nbd0 image.qcow2
+sgdisk -u 1:4cba83b2-97b0-4b9b-8794-a7dde491028c /dev/nbd0
+qemu-nbd --disconnect /dev/nbd0
+```
+
+镜像已经拷到手机上也不必重传：qcow2 只会改 3 个 64 KiB 簇，**按簇做二进制补丁只传 196 KB**。
+
+```bash
+# 构建机：算差异簇，导出补丁
+python3 - <<'P'
+import os
+A,B,CS='old.qcow2','fixed.qcow2',65536
+fa,fb=open(A,'rb'),open(B,'rb'); out=open('patch.bin','wb'); off=0
+while True:
+    a,b=fa.read(CS),fb.read(CS)
+    if not a and not b: break
+    if a!=b: out.write(b); print('cluster', off//CS, 'off', off)
+    off+=CS
+P
+# 手机：按同样顺序 dd 回去（skip=N seek=N conv=notrunc）
+```
+
+### 15.3 坑二：Debian genericcloud 没有 systemd-networkd 配置 → 拿不到 DHCP
+
+镜像里 `systemd-networkd` 是 enabled 的，但 `/etc/systemd/network/` 是**空的**（cloud-init 没
+datasource 就不生成配置）。表现：guest 里 `enp0s6` 没地址，`apt` 报 `Temporary failure
+resolving 'deb.debian.org'`。
+
+在 guest 里补一个文件即可（持久化在磁盘上）：
+
+```bash
+cat >/etc/systemd/network/20-wired.network <<'N'
+[Match]
+Name=en*
+[Network]
+DHCP=yes
+N
+systemctl enable --now systemd-networkd systemd-resolved
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+```
+
+之后 guest 拿到 `192.168.207.129/24`（DroidVM 的 `br-nat` 网桥 `192.168.207.1/24`），
+DNS 走 `127.0.0.53`，`getent hosts deb.debian.org` 正常。
+
+### 15.4 坑三：`memory_mb=1024` 但 guest 只有 960 MB
+
+UEFI/固件保留了约 64 MB。`free -m` 显示 `total 960`。要让 guest 真看到 1024，得把
+`memory_mb` 设到 **1088**（需要池子 ≥ 556 页；600 页池子够）。
+
+### 15.5 驱动 guest 控制台：`droidvm console` 是只读的
+
+`droidvm console [--raw] <vm_id> serial1` **只输出，不转发 stdin**（两种模式都试过）。
+想往 guest 里打字，用 Android 的输入注入：
+
+```bash
+am start -n cn.classfun.droidvm/.ui.main.MainActivity
+input tap 540 1200                 # 点一下 guest 显示区拿焦点
+input text "df -h /"; input keyevent 66
+```
+
+`input text` 能正确传 `+ / = $ * [ ]` 等字符；写文件时用 base64 最稳：
+
+```bash
+input text "echo <BASE64> | base64 -d > /etc/systemd/network/20-wired.network"
+```
+
+### 15.6 另一个坑：`droidvm start` 的参数是 JSON **字符串**，不是文件路径
+
+```bash
+# ✗ 会把路径当 JSON 解析 -> Line 1, Column 1 Syntax error
+droidvm start /data/local/tmp/vm.json
+# ✓
+droidvm start "$(cat /data/local/tmp/vm.json)"
+```
+
+另外 App 进程里缓存着旧的 VM 列表：改完 `vms.json` 后要 `am force-stop cn.classfun.droidvm`
+再启动，否则 `droidvm list` 还是旧的。
+
+### 15.7 实测结果
+
+```
+内核     6.12.113+deb13-cloud-arm64
+根分区   /dev/vda1  16G  已用 1.7G  (df -h / -> 16G)
+swap     /swapfile  1024M            (swapon --show)
+内存     free -m -> total 960 MB
+网络     enp0s6 192.168.207.129/24，DNS 解析正常
+登录     root / debian（哈希已在镜像内校验）
+```
