@@ -486,3 +486,119 @@ su -c 'sh /data/local/tmp/droidvm-bootstrap.sh'
 - `gunyah-host-share` 相关 issue 与 sm8650 内核补丁（官方 FAQ 收录）：
   - <https://github.com/Andy312432/android_kernel_samsung_sm8650_gunyah/commit/3d8767092fa186b77dfcbc5fd14b53ae17b04bb2>
   - <https://github.com/Andy312432/android_kernel_samsung_sm8650_gunyah/commit/b2ffff284b1f8b6cd79c280fb746b27fb6f0cbae>
+
+---
+
+## 13. 突破 512 MB：用大页池把 guest 内存做到 1 GB
+
+### 13.1 为什么裸跑 512 MB 是上限
+
+Gunyah 的 guest RAM 不是普通 malloc，而是由 RM 以 **memparcel** 形式从 **CMA** 出借：
+
+```
+CmaTotal = 602112 kB (588 MiB)          ← 本机硬上限
+512 MB VM 的窗口 = 502 MB               → 塞得下 ✅
+1 GB  VM 的窗口 = 1024 MB               → 超过 CMA 总量 ❌
+kernel: 不支持 256 MB 分块出借（App 弹窗 "cannot lend in 256 MB parcels"）
+调大 CMA: 只有 `cma=` cmdline / DT reserved-memory 能改 → 需刷 boot/dtbo（锁 BL 不可行）
+```
+
+### 13.2 实测的崩机记录（都是整机崩溃，需要重启 + 重跑 GhostLock）
+
+| 触发动作 | 结果 |
+|---|---|
+| 1 GB VM（single，无池） | ❌ 崩机 |
+| 1 GB VM（512 MB 分片） | ❌ 崩机 |
+| App 大页页「Enable」 | ❌ 崩机（模块默认 `system_reserve_mb=6144`，一次要预留 6 GB） |
+| App 大页页「保存」2.5 GiB | ❌ 崩机（CMA 分支） |
+| `gunyah-kvcalloc` 加载后 1 GB | ❌ 仍崩（kvcalloc 解决的是页指针数组的 kmalloc，不是 CMA） |
+| `ulimit -l unlimited` 后 1 GB | ❌ 仍崩 |
+| 绕过 `Huge-page reserve is short` 点 Start anyway | ❌ 崩机 |
+
+**结论：在 Gunyah 上，只要 guest 窗口 > 池子/CMA 能提供的量，就不是"报错"而是"崩机"**。
+所以**绝不能超过容量**，只能先把池子做大。
+
+### 13.3 正确的大页池用法（关键：别用 App 的 Enable/Save）
+
+```bash
+# 1) 装模块（KernelSU/Magisk 模块目录），并确认 .ko 在 load.sh 期望的位置
+#    手动 unzip 安装会漏掉 customize.sh，导致 .ko 只在 ko/ 子目录 → 必须补这一步：
+cp -f /data/adb/modules/gh-hugepage-reserve/ko/gh_hugepage_reserve/android14-6.1.ko \
+      /data/adb/modules/gh-hugepage-reserve/gh_hugepage_reserve.ko
+
+# 2) settings.prop（模块目录）—— 关键是 with_cma=0，关掉会崩机的 CMA 分支
+cat > /data/adb/modules/gh-hugepage-reserve/settings.prop <<'P'
+pool_want=512
+pool_want_with_cma=0
+boot_acquire=3
+boot_acquire_runs=2
+P
+
+# 3) 用模块自己的 loader 加载（不是 App 的 Enable）
+su -c 'sh /data/adb/modules/gh-hugepage-reserve/module/load.sh'
+```
+
+`pool_want` 单位是 **2 MiB 页**：512 = 1 GB，600 = 1.2 GB。
+
+### 13.4 把池子继续做大
+
+每轮 `acquire=3`（逐窗 evict）是**单向扫一遍**；被自己 evict 出来、落在扫描游标后方的窗口
+只有下一轮才捡得到 → **多跑几轮**。跑之前先停 VM（否则页被它占着）。
+
+```sh
+echo 3 > /sys/module/gh_hugepage_reserve/parameters/acquire
+# 轮询 acquire_active 直到 0，再看 refill_stat 的 pool_avail / acquire_stop_reason
+```
+
+`acquire_stop_reason="scanned all present memory"` = 内存已经扫完，到顶了；
+想再涨只能**先腾物理内存**（关后台大 App / 清缓存）。
+
+本仓库的 `scripts/pool.sh` 把以上封装好了：
+
+```bash
+su -c 'sh ~/droidvm/pool.sh status'        # 只看状态
+su -c 'sh ~/droidvm/pool.sh 600 6'         # 目标 600 页，最多 6 轮
+su -c 'sh ~/droidvm/pool.sh cancel'
+```
+
+### 13.5 三个必须同时满足的前置
+
+| 组件 | 做法 | 作用 |
+|---|---|---|
+| `gunyah-kvcalloc-gki-6.1.ko` | `ksud insmod .../gunyah-kvcalloc-gki-6.1.ko` | 官方 FAQ patch#1：页指针数组改 `kvcalloc`，避免大 guest 的连续 kmalloc 失败 |
+| `ulimit -l unlimited` | 写进 `usr/bin/crosvm` 包装脚本 | Gunyah 的 `account_locked_vm()` 把出借内存计入 RLIMIT_MEMLOCK，Android 默认只有 **64 KB** |
+| `DROIDVM_SHIM_PARCEL_MB=512` | 同上，包装脚本里 export | 把 SHIM 窗口拆成多笔 memparcel（例如 1024 MB → 512+502） |
+
+crosvm 包装脚本最终形态：
+
+```sh
+#!/system/bin/sh
+export LD_PRELOAD=/data/data/cn.classfun.droidvm/files/vmshim.so   # 6.1 缺 GH_VM_SET_BOOT_CONTEXT
+export DROIDVM_SHIM_PARCEL_MB=512
+ulimit -l unlimited 2>/dev/null || ulimit -l 8388608 2>/dev/null
+exec /data/data/cn.classfun.droidvm/usr/bin/crosvm.real "$@"
+```
+
+### 13.6 容量换算与实测结果
+
+```
+可开 VM 内存 ≈ (pool_total − 12) × 2 MB      # 12 页留给 shim / framebuffer / 杂项
+再向下取 64 的倍数
+```
+
+| 池子 | 可开 VM（上限） | 实测 |
+|---|---|---|
+| 无池（裸跑） | 512 MB | ✅ 稳定 |
+| 335 页 = 670 MB | 640 MB | ✅ 到 `login:` |
+| 471 页 = 942 MB | 896 MB | ✅ 到 `login:` |
+| 512 页 = 1024 MB | 960 MB | ✅ 到 `login:` |
+| **600 页 = 1200 MB** | **1024 MB（1 GB）** | ✅ **到 `login:`，`SHARE-BLOB` 512+502 MB，`VCPU_RUN` +64,207** |
+
+VM 设置：`memory_mb=<上面算的值>`、`prepare_lend_mthp=single`、`hugepages=true`、`protected_vm=pseudo_unprotected`。
+
+> ⚠️ 每次改内存前先 **停 VM**；`/dev/gunyah_share` 必须在（用 `scripts/droidvm-bootstrap.sh` 或手动 `insmod gunyah-host-share`）。
+
+### 13.7 上游文档
+
+`gh-hugepage-reserve` 的中文 README 已快照到本仓库：[docs/gh-hugepage-reserve-README_cn.md](docs/gh-hugepage-reserve-README_cn.md)
+（含 sysfs 参数契约、`settings.prop` 键、`load.sh` 阶梯、`acquire` 三模式、CMA 两个 lever 等细节）。
