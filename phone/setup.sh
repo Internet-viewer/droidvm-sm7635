@@ -12,6 +12,7 @@
 #   6) 校验 VM 配置（single / hugepages / pseudo_unprotected）
 # ============================================================
 D=/data/data/cn.classfun.droidvm
+APPUID=$(stat -c %u "$D" 2>/dev/null || echo 10512)
 DV=$D/usr/lib/modules/android14-6.1
 M=$D/../..                           # 占位，实际路径在下面
 HPM=/data/adb/modules/gh-hugepage-reserve
@@ -81,7 +82,7 @@ export DROIDVM_SHIM_PARCEL_MB=512
 ulimit -l unlimited 2>/dev/null || ulimit -l 8388608 2>/dev/null
 exec /data/data/cn.classfun.droidvm/usr/bin/crosvm.real "$@"
 W
-  chmod 755 "$BIN"; chown 10512:10512 "$BIN"
+  chmod 755 "$BIN"; chown "$APPUID:$APPUID" "$BIN"
   say 5 "crosvm 包装已写入（shim + PARCEL_MB=512 + ulimit）"
 else
   say 5 "!! 缺少 crosvm.real，跳过"
@@ -96,7 +97,7 @@ if [ -f "$J" ]; then
   sed -i 's/"hugepages": false/"hugepages": true/' "$J"
   sed -i 's/"protected_vm": "[a-z_]*"/"protected_vm": "pseudo_unprotected"/' "$J"
   sed -i 's/"protocol": "[a-z]*"/"protocol": "uefi"/' "$J"
-  chown 10512:10512 "$J"; chmod 600 "$J"
+  chown "$APPUID:$APPUID" "$J"; chmod 600 "$J"
   say 6 "VM 配置: $(grep -oE '"(memory_mb|prepare_lend_mthp|hugepages|protected_vm)": [^,]*' "$J" | tr '\n' ' ')"
 else
   say 6 "!! 缺少 vms.json"
