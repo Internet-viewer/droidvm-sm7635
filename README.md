@@ -760,3 +760,90 @@ swap     /swapfile  1024M            (swapon --show)
 网络     enp0s6 192.168.207.129/24，DNS 解析正常
 登录     root / debian（哈希已在镜像内校验）
 ```
+
+---
+
+## 16. 2026-11-05 重装复原：dev APK、三个启动闸门、池子为何一分钟就满
+
+重装 Termux + DroidVM 后从零复原，踩到 3 个**必须在 App 层解决**的启动闸门，以及 1 个池子扩容速度的疑问。
+
+### 16.1 release 包没有 per-KMI 内核模块
+
+```
+release APK: assets/prebuilts/prebuilt-arm64-v8a.7z   → 解包后 usr/lib/modules/ **不存在**，无任何 .ko
+dev    APK: assets/prebuilts/prebuilt-arm64-v8a.tar.xz → 首次启动解出 usr/lib/modules/{android14-6.1,android15-6.6,android16-6.12}
+```
+
+判别：`cmd package resolve-activity --brief` = `.ui.SplashActivity` 是 release，`.ui.setup.SetupActivity` 是 dev；
+`versionName=0.0.6 / versionCode=300` 是 release，`0.0.6.r242.g3348830 / versionCode=2720` 是 dev。
+
+覆盖安装 dev（版本号更高，数据保留）：
+
+```bash
+su -c 'cp dvm-dev.apk /data/local/tmp/; pm install -r -d /data/local/tmp/dvm-dev.apk'
+su -c 'am force-stop cn.classfun.droidvm; am start -n cn.classfun.droidvm/.ui.main.MainActivity'  # 首次启动才解 usr/
+ls /data/data/cn.classfun.droidvm/usr/lib/modules/android14-6.1/
+# gh-unmovable  gunyah-host-share  gunyah-kvcalloc  nproc-guard  udmabuf
+```
+
+启动要的两个先装：`gunyah-host-share`（→ `/dev/gunyah_share`）、`gunyah-kvcalloc`（dmesg 应出现
+`gh_kvcalloc: installed: gh_vm_mem_alloc@… use kvcalloc/kvfree`）；`gh-hugepage-reserve` 按 §13 处理。
+
+### 16.2 三个启动闸门（App/daemon 层，都是"还没拉起 crosvm 就失败"）
+
+| # | 症状 | 真因（日志证据） | 修法 |
+|---|---|---|---|
+| 1 | 点 Start 底部只弹 `failed to start VM`，`shim` 无新 pid | `DataStore: Skipping legacy network … java.lang.IllegalArgumentException: **Bridge name longer than 12 characters**` → 网络被判无效 → `Network <id> not found`（`StartHandler.java:41`） | 网桥名 **≤12 字符**（`br02f91d0f3a58`(15) → `br-nat`(6)），改完重启 App |
+| 2 | 同上，且 VM 是**向导新建**的 | 向导默认写 `"prepare_lend_mthp": "chunked"`；本内核不支持 256 MB 分块 | 改 `single`（§13.2：chunked/分片是崩机项） |
+| 3 | 大 guest 起不来 | 缺 §13.5 三行 | 包装脚本三行：`LD_PRELOAD=vmshim.so` + `DROIDVM_SHIM_PARCEL_MB=512` + `ulimit -l unlimited` |
+
+旧条目（release 版生成 + 手工改过）即使字段都对也会被 dev 版拒；**最稳的是删掉 VM（不勾删盘）后用
+`Create Wizard → Customize` 重新建**：dev 版向导里直接有 `Pseudo Unprotected`，默认 `CrosVM + Qualcomm Gunyah + 512 MiB + 1 vCPU`，
+Boot 页 `UEFI`（固件留空 = 内置 EDK2）。建完只改 `memory_mb` 与 `prepare_lend_mthp`。
+
+> 实测成功：`state=running`，shim 出现新 pid 且 `VCPU_RUN(0x05) ret=0`，`serial1` 走到
+> `Debian GNU/Linux 13 localhost ttyS0 / localhost login:`，`ssh.service`、`frpc.service` 均 `[ OK ]`。
+
+### 16.3 late-load KSU 的开机钩子（本机 post-fs-data 不执行）
+
+模块脚本若只在 `module/` 子目录（手动 unzip 安装，`customize.sh` 没跑），KSU 永远看不到。两条 service 阶段钩子，
+都复用模块自己的 `load.sh`：
+
+```sh
+# /data/adb/modules/gh-hugepage-reserve/service.sh  +  /data/adb/service.d/99-pool-load.sh
+D=/data/adb/modules/gh-hugepage-reserve
+[ -e /dev/gh_pinprobe ] && exit 0
+[ -f "$D/disable" ] && exit 0
+sh "$D/module/load.sh" >> /data/adb/pool-boot.log 2>&1
+```
+
+`ksud soft-reboot` 实测：`/data/adb/pool-boot.log` 出现 `kapi_check -> disable_kapi=…` → insmod → `boot_acquire=1 run 1/2, 2/2`，
+池子自动回到目标。**不要**把 `post-fs-data.sh` 复制到模块根目录：它的 stamp/crash 看门狗会在崩机后 `touch disable`。
+
+### 16.4 为什么这次池子几十秒就满（与历史"涨得慢"的差别）
+
+本次实测（硬重启后 ~15 分钟、目标 1068 页）：
+
+```
+53 → 450 → 641 → 897 → 1013 → 1068 页   （15 s 采样，约 50 秒）
+MemAvailable 5.39 GB → 3.96 GB，acquire_stop_reason=reached target
+```
+
+原因：
+
+1. `insmod` 时模块内部有**同步 prefill**，大头在那里就完成了，`boot_acquire` 只补尾部；
+2. 刚重启、后台 App 少、模块自己 `drop_caches` 清掉页缓存 → **碎片低**，`acquire=3` 的逐窗 sweep 几乎每个窗都过可行性闸；
+3. 目标量适中（1068/1324 页 = 2134/2648 MB）。
+
+历史那次慢：机器连跑多日 + 大 App 常驻 + 碎片高，绝大多数窗被"搬不走的 straggler"卡住，只能靠多轮慢补。
+对照反例仍然成立：目标拉到 **1380 页（2760 MB）** 直接整机重启（`acquire_mem_floor_mb=512` 的刹车来不及）。
+
+### 16.5 复现清单（从零到 running）
+
+1. dev APK 覆盖安装 → 启动一次解出 `usr/lib/modules/`；
+2. `insmod gunyah-host-share` + `gunyah-kvcalloc`；按 §13 备池（≥600 页 = 1024 MB guest）；
+3. crosvm 包装三行（§13.5）；
+4. App 里删 VM（**别勾删盘**）→ Create Wizard → Customize（CrosVM / Gunyah / Pseudo Unprotected / UEFI / 512 MiB / 1 vCPU）；
+5. 加盘（registered disk）+ 网络（网桥名 ≤12 字符）；
+6. 把 `memory_mb` 改到 `(pool_total−12)×2 MB` 向下取 64 的倍数、`prepare_lend_mthp` 改 `single`；
+7. Start → 读 `serial1` 到 `login:`。
