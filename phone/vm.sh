@@ -9,8 +9,9 @@
 #   su -c 'sh ~/droidvm/vm.sh logs [serial|stdio]'
 # ============================================================
 D=/data/data/cn.classfun.droidvm
-CLI=/data/local/tmp/dv/assets/bin/arm64-v8a/droidvm
+CLI=/data/data/cn.classfun.droidvm/bin/droidvm
 J=$D/files/vms.json
+APPUID=$(stat -c %u "$D" 2>/dev/null || echo 10512)
 P=/sys/module/gh_hugepage_reserve/parameters
 PY=/data/data/com.termux/files/usr/bin/python3
 
@@ -57,7 +58,7 @@ vm['memory_mb']=mb; vm['prepare_lend_mthp']='single'; vm['hugepages']=True
 json.dump(d, open(p,'w'), indent=4)
 print("  memory_mb =", mb)
 PY
-    chown 10512:10512 $J; chmod 600 $J
+    chown "$APPUID:$APPUID" $J; chmod 600 $J
     echo "  提示: 池子总量 $(pool_total) 页，建议上限 $(max_mb) MB"
     ;;
   start)
