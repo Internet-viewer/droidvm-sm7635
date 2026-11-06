@@ -847,3 +847,102 @@ MemAvailable 5.39 GB → 3.96 GB，acquire_stop_reason=reached target
 5. 加盘（registered disk）+ 网络（网桥名 ≤12 字符）；
 6. 把 `memory_mb` 改到 `(pool_total−12)×2 MB` 向下取 64 的倍数、`prepare_lend_mthp` 改 `single`；
 7. Start → 读 `serial1` 到 `login:`。
+
+---
+
+## 17. 讯飞 Spark-X2.6（maas-api.cn-huabei-1.xf-yun.com）：接入 OpenClaw 的三个兼容坑
+
+Guest 里给 OpenClaw（2026.11.x）加 `spark-x2.6`（293B-A30B MoE，1M 上下文）和 `spark-x2.6-4b`（端侧 4B）时，
+OpenAI 兼容层（`/v2`，`api: openai-completions`）有三处会回 **`400 {"code":10005,"message":"invalid request"}`**。
+
+### 17.1 Provider + 模型（`~/.openclaw/openclaw.json`）
+
+```json5
+{
+  models: {
+    mode: "merge",
+    providers: {
+      xunfei: {
+        baseUrl: "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+        api: "openai-completions",
+        apiKey: "***",
+        models: [
+          { id: "spark-x2.6", name: "Spark X2.6", reasoning: true, input: ["text"],
+            contextWindow: 1000000, maxTokens: 32768,
+            compat: { supportsTools: true, supportsUsageInStreaming: false } },
+          { id: "spark-x2.6-4b", name: "Spark X2.6 4B", reasoning: true, input: ["text"],
+            contextWindow: 1000000, maxTokens: 32768,
+            compat: { supportsTools: true, supportsUsageInStreaming: false,
+                      supportsDeveloperRole: false, supportsReasoningEffort: false } },
+        ],
+      },
+    },
+  },
+  // 还要把两个 id 加进 agents.entries.main.models 和 modelPolicy.allow，否则会话里选不到
+}
+```
+
+`GET /v2/models` 只返回这两个 id；`supportsTools` 放在 model 条目的 **`compat`** 里（顶层放会报
+`Unrecognized key: "supportsTools"`）。
+
+### 17.2 三个 10005 的来源（逐项实测）
+
+| 触发字段 | 谁中招 | 现象 | 修法 |
+|---|---|---|---|
+| `stream_options: {include_usage:true}` 且 `stream:false` | 两个模型 | 400/10005（`stream:true` 时反而正常） | `compat.supportsUsageInStreaming: false` |
+| `role: "developer"` 的消息 | **仅 4b**（x2.6 接受） | 400/10005 | `compat.supportsDeveloperRole: false`（仅 4b） |
+| `reasoning_effort: "medium"` | **仅 4b**（x2.6 接受） | 400/10005 | `compat.supportsReasoningEffort: false`（仅 4b） |
+
+其它参数都正常：`stream:true`、`temperature`、`top_p`、`store`、`max_completion_tokens=32768`、
+`tools` + `tool_choice:"auto"`（两个模型都能正确返回 `tool_calls`）。
+
+> `reasoning_effort` 这条最隐蔽：模型标了 `reasoning: true` 后 OpenClaw 会自动带上它，而 4B 的兼容层不认。
+
+### 17.3 抓 gateway 真实请求体（定位这类 400 的通用手法）
+
+日志里只有 `400/10005`，没有请求体。最省事的办法是把 provider 的 `baseUrl` 临时指向一个本地记录代理：
+
+```python
+# /root/reqlog.py —— 记录请求体并转发到真实 API
+import http.server, urllib.request, urllib.error
+LOG='/root/xunfei-requests.log'; UP='https://maas-api.cn-huabei-1.xf-yun.com'
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version='HTTP/1.1'
+    def do_POST(self):
+        n=int(self.headers.get('Content-Length',0)); body=self.rfile.read(n)
+        open(LOG,'ab').write(b'=== '+self.path.encode()+b'\n'+body+b'\n')
+        req=urllib.request.Request(UP+self.path,data=body,method='POST')
+        for k,v in self.headers.items():
+            if k.lower() in ('host','content-length','connection','accept-encoding'): continue
+            req.add_header(k,v)
+        try: r=urllib.request.urlopen(req,timeout=90); data=r.read(); code=r.status
+        except urllib.error.HTTPError as e: data=e.read(); code=e.code
+        except Exception as e: data=('{"error":"proxy: %s"}'%e).encode(); code=599
+        self.send_response(code); self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(data))); self.end_headers()
+        try: self.wfile.write(data)
+        except Exception: pass
+    def log_message(self,*a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1',18081),H).serve_forever()
+```
+
+```bash
+setsid nohup python3 /root/reqlog.py >/root/reqlog.out 2>&1 < /dev/null &
+# 把 baseUrl 临时改成 http://127.0.0.1:18081/v2，然后重启 gateway
+export XDG_RUNTIME_DIR=/run/user/0 && systemctl --user restart openclaw-gateway.service
+# 触发一次请求，再读 /root/xunfei-requests.log 里的 messages / tools / 参数
+# 定位修好后：停代理、baseUrl 改回真实地址、再次重启 gateway
+```
+
+注意 gateway 在 guest 里是 **root 的 systemd user unit**（`openclaw-gateway.service`），
+`openclaw gateway restart` 在 3 GB 的 guest 里可能长时间不返回，用
+`XDG_RUNTIME_DIR=/run/user/0 systemctl --user restart openclaw-gateway.service` 更干脆。
+
+### 17.4 验收
+
+```bash
+openclaw config validate
+openclaw infer model run --gateway --model xunfei/spark-x2.6    --prompt "Reply with exactly: SPARK-X26-OK"
+openclaw infer model run --gateway --model xunfei/spark-x2.6-4b --prompt "Reply with exactly: SPARK-4B-OK"
+# 实测：SPARK-X26-OK / SPARK-4B-OK
+```
