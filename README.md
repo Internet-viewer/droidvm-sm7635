@@ -946,3 +946,46 @@ openclaw infer model run --gateway --model xunfei/spark-x2.6    --prompt "Reply 
 openclaw infer model run --gateway --model xunfei/spark-x2.6-4b --prompt "Reply with exactly: SPARK-4B-OK"
 # 实测：SPARK-X26-OK / SPARK-4B-OK
 ```
+
+---
+
+## 18. br-nat 出不了网：App 重建网络后丢的两条规则（2026-11-06）
+
+现象：guest 里 `ping 192.168.207.1`（网关）通，`ping 1.1.1.1` 100% 丢包，
+`iptables -t nat -vnL droidvm_pst_br-nat` 计数一直是 **0**；手机自己出网正常。
+
+根因是 **两条规则** 在 App/系统重建网络后丢失（链和 MASQUERADE 规则本身还在，所以看起来"配置没问题"）：
+
+| # | 缺什么 | 后果 | 证据 |
+|---|---|---|---|
+| 1 | `POSTROUTING` 里没有 `-j droidvm_pst` 跳转（只剩 `qcom_nicm_masquerade_skip`、`tetherctrl_nat_POSTROUTING`） | NAT 链永远不被执行，计数 0 | `iptables -t nat -S POSTROUTING` |
+| 2 | `FORWARD` 里没有 br-nat 的 ACCEPT，而 `tetherctrl_FORWARD` 末尾是 **`-j DROP`** | 转发包在 FORWARD 被丢，根本到不了 POSTROUTING | `iptables -S tetherctrl_FORWARD` |
+
+路由本身是好的（`ip route get 1.1.1.1 from 192.168.207.10 iif br-nat` → `dev tun0 table tun0`，
+且手机 `ping -I tun0 1.1.1.1` 0% 丢包），`net.ipv4.ip_forward=1` 也正常——所以别去改路由。
+
+修复（幂等脚本 `phone/fix-brnat-nat.sh`，语桥名可传参）：
+
+```bash
+su -c 'sh ~/droidvm/fix-brnat-nat.sh'          # 默认 br-nat
+su -c 'sh ~/droidvm/fix-brnat-nat.sh br-xxx'   # 其它网桥名
+```
+
+脚本做三件事：
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -C POSTROUTING -j droidvm_pst          || iptables -t nat -A POSTROUTING -j droidvm_pst
+iptables -C FORWARD -i br-nat -j ACCEPT                 || iptables -I FORWARD 1 -i br-nat -j ACCEPT
+iptables -C FORWARD -o br-nat -j ACCEPT                 || iptables -I FORWARD 1 -o br-nat -j ACCEPT
+# 若 app 的链/规则也不在，脚本会补：droidvm_pst -> droidvm_pst_<bridge> -> MASQUERADE(-s 192.168.207.0/24 ! -o <bridge>+)
+```
+
+注意 MASQUERADE 的出口匹配是 **`! -o br-nat+`**（带 `+`），写 `-j MASQUERADE` 的 `-C` 检查时要完全一致，
+否则会叠出第二条重复规则（无害但计数分叉、排查时容易看错）。
+
+实测修复后：`ping 1.1.1.1` 0% 丢包（2.6 ms）、`curl http://deb.debian.org/` → 200、DNS 正常解析，
+`droidvm_pst_br-nat` 计数器开始增长。
+
+**这些规则只在内存里**：手机重启或 App 重建网络后会再丢，跑一次脚本即可；要长期稳定可放到
+KernelSU 的 `service.d`（等 `br-nat` 出现后再执行）或 App 启动后手动跑。
