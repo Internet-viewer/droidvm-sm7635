@@ -1,3 +1,10 @@
+# ⚠️ 重要警示 ⚠️
+> **请注意备份数据，root 手机有风险。**
+> **以下内容仅供学习参考，请自行评估风险后操作。**
+> **作者不对任何数据丢失或设备损坏负责。**
+
+---
+
 # 在 Redmi Note 14 Pro+（Snapdragon 7s Gen 3 / SM7635）上跑 DroidVM（Gunyah 硬件虚拟化）
 
 > 实测环境：Redmi Note 14 Pro+ 5G（`24115RA8EC` / `amethyst` / `ro.board.platform=volcano` = SM7635）、
