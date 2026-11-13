@@ -190,10 +190,17 @@ EOF
   update-initramfs -u -k "$KVER"
 
   step "确认 initramfs 里是补丁版"
-  if lsinitramfs "/boot/initrd.img-${KVER}" | grep -q 'updates/droidvm/virtio-gpu.ko'; then
+  # 注意: 不能写成 `lsinitramfs ... | grep -q`。grep -q 命中后立刻退出,
+  # lsinitramfs(经 unmkinitramfs/cpio) 会收到 SIGPIPE 并以非 0 退出,
+  # 在 pipefail 下整条管道判失败 => 误报 "initramfs 里没有补丁版"。
+  # 先把输出落到变量/临时文件再判断。
+  local ir=""
+  ir=$(lsinitramfs "/boot/initrd.img-${KVER}" 2>/dev/null || true)
+  if printf '%s\n' "$ir" | grep -q 'updates/droidvm/virtio-gpu.ko'; then
     grn "  initramfs 含补丁版 ✓"
   else
     red "  initramfs 里没有补丁版，重启后会加载原版！"
+    red "  检查: /etc/initramfs-tools/modules 是否含 virtio_gpu"
     exit 1
   fi
 }
