@@ -33,11 +33,12 @@ OpenGL: zink Vulkan 1.4(Virtio-GPU GFXStream (Adreno (TM) 810) (MESA_GFXSTREAM))
 
 | 场景 | FPS | FrameTime | Score |
 |------|-----|-----------|-------|
-| build | 369 | 2.712 ms | 368 |
-| **texture** | **599** | **1.671 ms** | 598 |
-| shading | 333 | 3.011 ms | 332 |
+| build | 369–583 | 1.717–2.712 ms | 368–582 |
+| **texture** | **432–679** | **1.475–2.318 ms** | 431–678 |
+| shading | 333–540 | 1.853–3.011 ms | 332–539 |
 
-多次实测波动范围：build 312–393、texture 599–679、shading 332–353。
+波动主要来自虚拟机负载与 thermal 状态，不是渲染栈本身不稳定。
+最好的一组（build 583 / shading 540）出现在 Mesa 全量重建后的首次运行。
 所有数字都是在 **guest 内原生运行**，无任何 CPU 回退（`llvmpipe` 未参与）。
 
 ### 重启后自动生效
@@ -408,7 +409,56 @@ glmark2 --benchmark build:texture:shading
 
 ---
 
-## 5. 回滚
+## 5. 从干净的 6.12 镜像重建（实操时间线）
+
+把 qcow2 还原到装 backports 之前的状态（`6.12.116+deb13-arm64`、wayland 1.23.1、
+无 `updates/droidvm/`），按上面流程重走一遍的实际耗时：
+
+| 阶段 | 耗时 | 备注 |
+|------|------|------|
+| `apt install` 7.2.12 image+headers | ~12 min | 包大，网络是瓶颈 |
+| 重启进 7.2.12 | ~5 min | VM 重启后可能不自启，需 `boot_now.py` 再拉一次 |
+| wayland 升 1.26 | ~3 min | |
+| Mesa 构建依赖 | ~8 min | |
+| 下载 Mesa tarball (111 MB) | ~6 min | |
+| **Mesa 编译 1737/1737** | **~95 min** | `-j4`，与 guest 并行编译 guest-additions |
+| guest-additions 编译 | ~6 min | `-j2`，可与 Mesa 并行 |
+| 持久化 + initramfs 重建 | ~4 min | |
+| 验证 + 跑分 | ~10 min | |
+
+**总计约 2.5 小时**，其中 Mesa 编译占 60%。
+
+### 并行技巧
+
+Mesa 编译期间可以同时完成 guest-additions 的编译（`make -j2`），两者互不依赖；
+但不要同时跑 `ninja -j4` 和 `make -j4`，4 核 guest 会因换页而明显变慢。
+
+### Mesa 进度自查
+
+```sh
+# 后台启动
+tmux new -d -s mesa 'cd /root && ninja -C build-mesa -j4 > /root/mesa-build.log 2>&1; echo EXIT=$? >> /root/mesa-build.log'
+# 查进度
+tail -1 /root/mesa-build.log          # [1288/1737] Compiling ...
+grep 'EXIT=' /root/mesa-build.log     # EXIT=0 表示成功
+```
+
+构建过程中的阶段性里程碑（可用于判断卡在哪一段）：
+
+```
+[  117/1737]  src/util              ralloc / 基础工具
+[  369/1737]  src/compiler/nir      着色器编译器
+[  619/1737]  src/mesa              GL 状态机
+[ 1019/1737]  src/gallium/drivers/zink
+[ 1288/1737]  src/vulkan/runtime
+[ 1601/1737]  src/freedreno/vulkan
+[ 1654/1737]  src/gfxstream/guest/vulkan   ← 关键 ICD
+[ 1737/1737]  linking libdril_dri.so / dri_gbm.so
+```
+
+---
+
+## 6. 回滚
 
 ```sh
 # 回到原版内核（保留 7.2.12 在 GRUB 中可选）
@@ -428,7 +478,7 @@ sudo update-initramfs -u -k $(uname -r)
 
 ---
 
-## 6. 环境摘要
+## 7. 环境摘要
 
 | 项 | 值 |
 |----|-----|
@@ -446,8 +496,15 @@ sudo update-initramfs -u -k $(uname -r)
 
 ---
 
-## 7. 时间线
+## 8. 时间线
 
 - **2026-11-13** — 从 6.12 移植方案切换到 backports 7.2.12，6 处 API 适配后一次通过。
   完成 zink + gfxstream 全链路验证，glmark2 texture 达 679 FPS。
   修补 initramfs 抢先加载问题，实现重启后零干预自动生效。
+- **2026-11-13（二次）** — qcow2 还原到 backports 之前后完整重走一遍，全流程 2.5 小时。
+  Mesa 1737/1737 EXIT=0，glmark2 build 583 / shading 540（该次为历史最好）。
+  确认流程可重复：两次构建产出的 guest-additions 尺寸逐字节相同
+  （`gunyah_guest.ko` 442472、`virtio-gpu.ko` 5207952）。
+- **已知环境问题**：VM 内 `reboot` 后 crosvm 偶尔不会自动拉起新实例，表现为
+  `No route to host`。此时在手机上重跑 `boot_now.py` 即可；与 GPU 配置无关（6.12 时代就有）。
+  termux 到 guest 的 SSH 隧道也会间歇断开，长任务建议在 guest 内用 tmux 承载。
